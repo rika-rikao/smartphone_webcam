@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PWA Camera Node</title>
+  
+  <!-- PWA 設定 -->
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#111111">
+  <link rel="apple-touch-icon" href="icon-192.png">
+
+  <style>
+    body { font-family: sans-serif; background: #111; color: #fff; text-align: center; margin: 0; padding: 15px; }
+    video { width: 100%; max-width: 480px; background: #000; border-radius: 8px; border: 2px solid #333; }
+    .status-box { margin: 10px auto; padding: 10px; background: #222; border-radius: 6px; max-width: 480px; font-size: 0.85em; text-align: left; }
+    .status { color: #00ffcc; font-weight: bold; }
+    .info { color: #aaa; margin-top: 5px; }
+  </style>
+</head>
+<body>
+  <h2>📱 Camera Node (Phone)</h2>
+  <video id="preview" autoplay playsinline muted></video>
+
+  <div class="status-box">
+    <div>ステータス: <span id="status" class="status">待機中...</span></div>
+    <div id="info" class="info">解像度: 未セット | 音声: 未セット</div>
+  </div>
+
+  <script>
+    let currentStream = null;
+    let peerConnection = null;
+    let mediaRecorder = null;
+    let ws = null;
+
+    const videoElem = document.getElementById('preview');
+    const statusElem = document.getElementById('status');
+    const infoElem = document.getElementById('info');
+
+    // --- 1. カメラ & 音声（Opus/HE-AAC相当）の初期化 ---
+    async function startMedia(width = 854, height = 480, fps = 15, videoBps = 350000, audioBps = 40000, codec = 'video/webm;codecs=vp8,opus') {
+      if (currentStream) {
+        currentStream.getTracks().forEach(track => track.stop());
+      }
+
+      try {
+        const constraints = {
+          video: {
+            width: { ideal: width },
+            height: { ideal: height },
+            frameRate: { max: fps, ideal: fps },
+            facingMode: "environment"
+          },
+          audio: {
+            channelCount: { ideal: 1 },
+            sampleRate: { ideal: 24000 },
+            echoCancellation: true,
+            noiseSuppression: true
+          }
+        };
+
+        currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+        videoElem.srcObject = currentStream;
+
+        infoElem.innerText = `映像: ${width}x${height} ${fps}fps (${Math.round(videoBps/1000)}kbps) | 音声: Opus モノラル (${Math.round(audioBps/1000)}kbps)`;
+        statusElem.innerText = "配信可能 (アクティブ)";
+
+        if (peerConnection) {
+          const videoSender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
+          if (videoSender) videoSender.replaceTrack(currentStream.getVideoTracks()[0]);
+          
+          const audioSender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'audio');
+          if (audioSender) audioSender.replaceTrack(currentStream.getAudioTracks()[0]);
+        }
+
+        startChunkEncoder(videoBps, audioBps, codec);
+
+      } catch (e) {
+        statusElem.innerText = `カメラエラー: ${e.message}`;
+      }
+    }
+
+    // --- 2. Low-Bitrate Chunk 送信 ---
+    function startChunkEncoder(vBps, aBps, mimeType) {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+
+      const options = {
+        mimeType: MediaRecorder.isTypeSupported(mimeType) ? mimeType : 'video/webm',
+        videoBitsPerSecond: vBps,
+        audioBitsPerSecond: aBps
+      };
+
+      try {
+        mediaRecorder = new MediaRecorder(currentStream, options);
+        mediaRecorder.ondataavailable = async (e) => {
+          if (e.data && e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
+            const arrayBuffer = await e.data.arrayBuffer();
+            ws.send(arrayBuffer);
+          }
+        };
+        mediaRecorder.start(100);
+      } catch (err) {
+        console.warn("MediaRecorder 初期化スキップ:", err);
+      }
+    }
+
+    // --- 3. プロモード設定の更新コマンドハンドラ ---
+    function handleRemoteCommand(cmd) {
+      console.log("リモート設定更新:", cmd);
+      if (cmd.action === 'apply_settings') {
+        startMedia(cmd.width, cmd.height, cmd.fps, cmd.bitrate, cmd.audioBitrate, cmd.codec);
+      }
+    }
+
+    // --- 4. 同一Wi-Fi / WebSocket / WebRTC シグナリング接続 ---
+    function initWifiConnection(serverIp) {
+      ws = new WebSocket(`ws://${serverIp}`);
+      ws.onopen = () => { statusElem.innerText = "Wi-Fi (WebSocket) 接続完了"; };
+      
+      ws.onmessage = async (event) => {
+        if (typeof event.data === "string") {
+          const data = JSON.parse(event.data);
+          
+          if (data.sdp) {
+            if (!peerConnection) createPeerConnection();
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
+            if (data.sdp.type === 'offer') {
+              const answer = await peerConnection.createAnswer();
+              await peerConnection.setLocalDescription(answer);
+              ws.send(JSON.stringify({ sdp: peerConnection.localDescription }));
+            }
+          } else if (data.candidate) {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+          } else if (data.command) {
+            handleRemoteCommand(data.command);
+          }
+        }
+      };
+    }
+
+    function createPeerConnection() {
+      peerConnection = new RTCPeerConnection();
+      if (currentStream) {
+        currentStream.getTracks().forEach(track => peerConnection.addTrack(track, currentStream));
+      }
+      peerConnection.ondatachannel = (e) => {
+        e.channel.onmessage = (msg) => handleRemoteCommand(JSON.parse(msg.data));
+      };
+      peerConnection.onicecandidate = (e) => {
+        if (e.candidate && ws) ws.send(JSON.stringify({ candidate: e.candidate }));
+      };
+    }
+
+    // 初期起動
+    startMedia(854, 480, 15, 350000, 40000);
+
+    // --- 5. PWA Service Worker の登録 ---
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js')
+          .then((registration) => {
+            console.log('SW registered: ', registration.scope);
+          })
+          .catch((err) => {
+            console.error('SW registration failed: ', err);
+          });
+      });
+    }
+  </script>
+</body>
+</html>
